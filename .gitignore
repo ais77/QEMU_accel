@@ -1,0 +1,6 @@
+*.elf
+*.o
+*.ko
+*.log
+*.img
+*.img.xz
