@@ -1,0 +1,126 @@
+
+ubuntu@ubuntu:~/matmul$ cat ~/matmul/matmul_drv.c
+#include <linux/module.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/io.h>
+#include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/gfp.h>
+
+#define ACCEL_PHYS  0x10200000UL
+#define BUF_ORDER   4                  /* 16 pages = 64 KB */
+#define MM_IOC_RUN  0x4d01
+
+static void __iomem *regs;
+static unsigned long buf;
+static phys_addr_t buf_phys;
+static DEFINE_MUTEX(lock);
+
+static int mm_mmap(struct file *f, struct vm_area_struct *vma)
+{
+    unsigned long size = vma->vm_end - vma->vm_start;
+    if (size > (PAGE_SIZE << BUF_ORDER))
+        return -EINVAL;
+    return remap_pfn_range(vma, vma->vm_start, buf_phys >> PAGE_SHIFT,
+                           size, vma->vm_page_prot);
+}
+
+/* Layout in the buffer: A at +0, B at +16K, C at +32K (each up to 64x64 ints) */
+static long mm_ioctl(struct file *f, unsigned int cmd, unsigned long n)
+{
+    unsigned int st = 0;
+    long ret;
+    int i;
+
+    if (cmd != MM_IOC_RUN || n < 1 || n > 64)
+        return -EINVAL;
+
+    mutex_lock(&lock);
+    writel((u32)buf_phys,            regs + 0x00);
+    writel((u32)(buf_phys + 16384),  regs + 0x04);
+    writel((u32)(buf_phys + 32768),  regs + 0x08);
+    writel((u32)n,                   regs + 0x0c);
+    writel(1,                        regs + 0x10);
+
+    for (i = 0; i < 1000000; i++) {
+        st = readl(regs + 0x14);
+        if (st & 0x6)
+            break;
+        cpu_relax();
+    }
+    if (st & 0x4)       ret = -EIO;
+    else if (!(st & 0x2)) ret = -ETIMEDOUT;
+    else                ret = readl(regs + 0x18);   /* modeled cycles */
+    mutex_unlock(&lock);
+    return ret;
+}
+
+static const struct file_operations fops = {
+    .owner          = THIS_MODULE,
+    .mmap           = mm_mmap,
+    .unlocked_ioctl = mm_ioctl,
+};
+
+static struct miscdevice mdev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name  = "matmul",
+    .fops  = &fops,
+    .mode  = 0666,
+};
+
+static int __init mm_init(void)
+{
+    regs = ioremap(ACCEL_PHYS, 0x1000);
+    if (!regs)
+        return -ENOMEM;
+    buf = __get_free_pages(GFP_KERNEL | GFP_DMA32 | __GFP_ZERO, BUF_ORDER);
+    if (!buf) {
+        iounmap(regs);
+        return -ENOMEM;
+    }
+    buf_phys = virt_to_phys((void *)buf);
+    pr_info("matmul: buffer at phys 0x%llx\n", (unsigned long long)buf_phys);
+    return misc_register(&mdev);
+}
+
+static void __exit mm_exit(void)
+{
+    misc_deregister(&mdev);
+    free_pages(buf, BUF_ORDER);
+    iounmap(regs);
+}
+
+module_init(mm_init);
+module_exit(mm_exit);
+MODULE_LICENSE("GPL");
+ubuntu@ubuntu:~/matmul$ cat ~/matmul/mm_test.py
+import os, mmap, fcntl, time
+import numpy as np
+
+N = 32
+fd = os.open("/dev/matmul", os.O_RDWR | os.O_SYNC)
+mm = mmap.mmap(fd, 65536)
+buf = np.frombuffer(mm, dtype=np.int32)
+
+A = buf[0:N*N].reshape(N, N)            # A at +0
+B = buf[4096:4096 + N*N].reshape(N, N)  # B at +16 KB
+C = buf[8192:8192 + N*N].reshape(N, N)  # C at +32 KB
+
+rng = np.random.default_rng(1)
+A[:] = rng.integers(-5, 6, (N, N), dtype=np.int32)
+B[:] = rng.integers(-5, 6, (N, N), dtype=np.int32)
+
+t0 = time.perf_counter()
+cycles = fcntl.ioctl(fd, 0x4d01, N)     # returns the modeled cycle count
+t_hw = time.perf_counter() - t0
+
+ref = A @ B                             # int32 arithmetic, wraps like the device
+print("match:", np.array_equal(C, ref))
+print("modeled cycles:", cycles)
+print("accelerator call: %.6f s" % t_hw)
+ubuntu@ubuntu:~/matmul$ cat ~/matmul/Makefile
+obj-m += matmul_drv.o
+all:
+        make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+ubuntu@ubuntu:~/matmul$
